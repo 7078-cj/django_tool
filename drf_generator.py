@@ -1,6 +1,6 @@
 """
 DRF Generator - paste Django models, get serializers, views, urls, signals,
-WebSocket consumers and ready-to-read API payload docs.
+WebSocket consumers, ready-to-read API payload docs, and React components.
 
 Run:  python drf_generator.py
 Needs only the Python standard library (tkinter). Django is NOT required,
@@ -1179,14 +1179,15 @@ THEME = {            # code editor (VS Code "Dark+" colors)
 }
 
 TAG_COLORS = {
-    "keyword": "#569cd6",   # class, def, return, True, None, self ...
-    "class": "#4ec9b0",     # class names, models, CharField ...
+    "keyword": "#569cd6",   # class, def, return, import, export, const ...
+    "class": "#4ec9b0",     # class names, React components, types ...
     "function": "#dcdcaa",  # function names, calls, decorators
     "string": "#ce9178",
     "number": "#b5cea8",
     "comment": "#6a9955",
     "variable": "#9cdcfe",  # field names, attributes
     "constant": "#4fc1ff",  # PROTECT, CASCADE ...
+    "jsx_tag": "#808080",   # JSX element brackets/tags
 }
 
 METHOD_COLORS = {"GET": "#2563eb", "POST": "#16a34a", "PUT": "#d97706",
@@ -1215,17 +1216,23 @@ def mono_font(size=None):
 # --------------------------------------------------------------------------
 # Syntax highlighting
 # --------------------------------------------------------------------------
-_KEYWORDS = set(keyword.kwlist)  # includes True / False / None
+_JS_KW = {"import", "export", "default", "from", "function", "const", "let", "var",
+          "async", "await", "return", "if", "else", "try", "catch", "finally",
+          "throw", "new", "null", "undefined", "true", "false", "typeof"}
+_KEYWORDS = set(keyword.kwlist) | _JS_KW
+
 _STRING = (
     r"(?:[rRbBfFuU]{1,2})?"
     r'(?:"""[\s\S]*?(?:"""|\Z)'
     r"|'''[\s\S]*?(?:'''|\Z)"
     r'|"(?:\\.|[^"\\\n])*(?:"|$)'
-    r"|'(?:\\.|[^'\\\n])*(?:'|$))"
+    r"|'(?:\\.|[^'\\\n])*(?:'|$)"
+    r"|`(?:\\.|[^`\\])*(?:`|$))"
 )
 TOKEN_RE = re.compile(
-    r"(?P<comment>#[^\n]*)"
+    r"(?P<comment>#[^\n]*|//[^\n]*)"
     r"|(?P<string>" + _STRING + r")"
+    r"|(?P<jsx_tag></?[A-Za-z0-9_\-]+>)"
     r"|(?P<decorator>@[A-Za-z_][\w.]*)"
     r"|(?P<number>\b\d[\d_]*(?:\.\d+)?\b)"
     r"|(?P<name>[A-Za-z_]\w*)",
@@ -1251,6 +1258,8 @@ def tokenize_python(text):
             prev_word = None
             if kind == "decorator":
                 yield s, e, "function"
+            elif kind == "jsx_tag":
+                yield s, e, "jsx_tag"
             else:
                 yield s, e, {"comment": "comment", "string": "string",
                              "number": "number"}[kind]
@@ -1260,10 +1269,8 @@ def tokenize_python(text):
         after = text[e:e + 80].lstrip(" \t")
         if word in _KEYWORDS or word in ("self", "cls"):
             tag = "keyword"
-        elif prev_word == "class":
-            tag = "class"
-        elif prev_word == "def":
-            tag = "function"
+        elif prev_word in ("class", "function"):
+            tag = "class" if word[0].isupper() else "function"
         elif after.startswith("("):
             tag = "class" if word[0].isupper() else "function"
         elif word.isupper() and len(word) > 1:
@@ -1272,7 +1279,7 @@ def tokenize_python(text):
             tag = "class"
         else:
             tag = "variable"
-        prev_word = word if word in ("class", "def") else None
+        prev_word = word if word in ("class", "def", "function") else None
         yield s, e, tag
 
 
@@ -1529,6 +1536,8 @@ def empty_state(parent, title, hint):
 # --------------------------------------------------------------------------
 class App(tk.Tk):
     PAYLOAD_TAB = "API Payloads"
+    BACKEND_TAB = "Backend"
+    FRONTEND_TAB = "Frontend"
 
     def __init__(self):
         super().__init__()
@@ -1672,12 +1681,14 @@ class App(tk.Tk):
                    ).pack(side="left", padx=6)
         ttk.Button(side, text="Clear", command=self.clear_input).pack(side="left")
 
-        self.tabs = ttk.Notebook(right)
+        self.categories = ttk.Notebook(right)
+        self.categories.pack(fill="both", expand=True)
+        backend = ttk.Frame(self.categories)
+        self.categories.add(backend, text=self.BACKEND_TAB)
+        self.tabs = ttk.Notebook(backend)
         self.tabs.pack(fill="both", expand=True)
         self.out_widgets = {}
-        for fname in ("serializers.py", "views.py", "urls.py", "filters.py",
-                      "signals.py", "consumers.py", "routing.py",
-                      "channels_setup.py", "filtering_setup.py"):
+        for fname in ("serializers.py", "views.py", "urls.py", "filters.py", "signals.py", "consumers.py", "routing.py", "channels_setup.py", "filtering_setup.py"):
             txt = make_editor(self.tabs, readonly=True)
             txt.config(state="disabled")
             self.tabs.add(txt.container, text=fname)
@@ -1685,6 +1696,9 @@ class App(tk.Tk):
         pay = ttk.Frame(self.tabs)
         self.tabs.add(pay, text=self.PAYLOAD_TAB)
         self._build_payload_tab(pay)
+        frontend = ttk.Frame(self.categories)
+        self.categories.add(frontend, text=self.FRONTEND_TAB)
+        self._build_frontend_tab(frontend)
 
         bottom = ttk.Frame(self, padding=(12, 4, 12, 12))
         bottom.pack(fill="x")
@@ -1853,6 +1867,7 @@ class App(tk.Tk):
         if self.model_var.get() not in names:
             self.model_var.set(names[0])
         self.render_payloads()
+        self.render_frontend()
         self.set_status(f"Generated for {len(models)} model(s): {', '.join(names)}")
 
     def current_doc(self):
@@ -1896,23 +1911,383 @@ class App(tk.Tk):
                         "Enable \"Consumers, routing, setup\" in the options above "
                         "to see the WebSocket payloads.")
 
+    def _build_frontend_tab(self, parent):
+        top = ttk.Frame(parent, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="Model").pack(side="left")
+        self.frontend_model_var = tk.StringVar()
+        self.frontend_model_combo = ttk.Combobox(top, textvariable=self.frontend_model_var, state="readonly", width=28)
+        self.frontend_model_combo.pack(side="left", padx=8)
+        self.frontend_model_combo.bind("<<ComboboxSelected>>", lambda _e: self.render_frontend())
+        self.frontend_tabs = ttk.Notebook(parent)
+        self.frontend_tabs.pack(fill="both", expand=True)
+        self.frontend_widgets = {}
+        for label in ("List", "Card", "Create Form", "Update Form"):
+            editor = make_editor(self.frontend_tabs, readonly=True)
+            editor.config(state="disabled")
+            self.frontend_tabs.add(editor.container, text=label)
+            self.frontend_widgets[label] = editor
+
+    def _react_samples(self, doc):
+        model, route = doc["name"], doc["route"]
+        api_url = f"http://localhost:8000/api/{route}/"
+        writable = [f for f in doc["fields"] if f["name"] != "id" and f["required"] != "read-only"]
+        display = [f["name"] for f in doc["fields"] if f["name"] != "id"]
+        primary = display[0] if display else "id"
+
+        list_code = f'''import {{ useEffect, useState }} from "react";
+
+const API_URL = "{api_url}";
+
+export default function {model}List() {{
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {{
+    const controller = new AbortController();
+
+    fetch(API_URL, {{ signal: controller.signal }})
+      .then((res) => {{
+        if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+        return res.json();
+      }})
+      .then((data) => setItems(Array.isArray(data) ? data : (data.results ?? [])))
+      .catch((err) => {{
+        if (err.name !== "AbortError") setError(err.message);
+      }})
+      .finally(() => setLoading(false));
+
+    return () => controller.abort();
+  }}, []);
+
+  if (loading) return <p className="loading">Loading {plural(model).lower()}...</p>;
+  if (error) return <p role="alert" className="error-message">{{error}}</p>;
+
+  return (
+    <section className="{snake(model)}-list-container">
+      <h1>{model} List</h1>
+      <ul>
+        {{items.map((item) => (
+          <li key={{item.id}}>
+            {{item["{primary}"] ?? `Record #${{item.id}}`}}
+          </li>
+        ))}}
+      </ul>
+    </section>
+  );
+}}
+'''
+
+        card_fields = "\n".join(
+            f'          <p><strong>{name.replace("_", " ").title()}:</strong> {{String(item["{name}"] ?? "—")}}</p>'
+            for name in display[:8]
+        )
+
+        card_code = f'''import {{ useEffect, useState }} from "react";
+
+const API_URL = "{api_url}";
+
+export default function {model}Cards() {{
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {{
+    const controller = new AbortController();
+
+    fetch(API_URL, {{ signal: controller.signal }})
+      .then((res) => {{
+        if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+        return res.json();
+      }})
+      .then((data) => setItems(Array.isArray(data) ? data : (data.results ?? [])))
+      .catch((err) => {{
+        if (err.name !== "AbortError") setError(err.message);
+      }})
+      .finally(() => setLoading(false));
+
+    return () => controller.abort();
+  }}, []);
+
+  if (loading) return <p className="loading">Loading cards...</p>;
+  if (error) return <p role="alert" className="error-message">{{error}}</p>;
+
+  return (
+    <section className="record-grid">
+      <h1>{model} Cards</h1>
+      <div className="card-container">
+        {{items.map((item) => (
+          <article className="record-card" key={{item.id}}>
+            <h2>{{item["{primary}"] ?? `Record #${{item.id}}`}}</h2>
+{card_fields}
+          </article>
+        ))}}
+      </div>
+      <style>{{`
+        .record-grid {{ padding: 1rem; }}
+        .card-container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }}
+        .record-card {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .record-card h2 {{ margin-top: 0; font-size: 1.25rem; }}
+        .record-card p {{ margin: 0.4rem 0; color: #374151; }}
+      `}}</style>
+    </section>
+  );
+}}
+'''
+
+        initial_state_lines = ",\n".join(f'  "{f["name"]}": ""' for f in writable)
+
+        create_form_inputs = []
+        for f in writable:
+            name = f["name"]
+            typ = ("number" if f["type"] in ("integer", "number", "decimal (string)")
+                   else "date" if f["type"] == "date (YYYY-MM-DD)"
+                   else "email" if "email" in name
+                   else "text")
+            req = "required" if f["required"] == "yes" else ""
+            create_form_inputs.append(
+                f'      <div className="form-group">\n'
+                f'        <label htmlFor="{name}">{name.replace("_", " ").title()}</label>\n'
+                f'        <input\n'
+                f'          id="{name}"\n'
+                f'          name="{name}"\n'
+                f'          type="{typ}"\n'
+                f'          value={{form["{name}"] ?? ""}}\n'
+                f'          onChange={{handleChange}}\n'
+                f'          {req}\n'
+                f'        />\n'
+                f'      </div>'
+            )
+
+        create_inputs_str = "\n".join(create_form_inputs)
+
+        create_form_code = f'''import {{ useState }} from "react";
+
+const API_URL = "{api_url}";
+
+const INITIAL_FORM = {{
+{initial_state_lines}
+}};
+
+export default function Create{model}Form() {{
+  const [form, setForm] = useState(INITIAL_FORM);
+  const [message, setMessage] = useState("");
+  const [errors, setErrors] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  function handleChange(e) {{
+    const {{ name, value, type, checked }} = e.target;
+    setForm((prev) => ({{
+      ...prev,
+      [name]: type === "checkbox" ? checked : type === "number" && value !== "" ? Number(value) : value,
+    }}));
+  }}
+
+  async function handleSubmit(e) {{
+    e.preventDefault();
+    setMessage("");
+    setErrors(null);
+    setSubmitting(true);
+
+    try {{
+      const response = await fetch(API_URL, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(form),
+      }});
+      const data = await response.json().catch(() => ({{}}));
+
+      if (!response.ok) {{
+        setErrors(data);
+        throw new Error("Creation failed. Please review input fields.");
+      }}
+
+      setMessage("Created successfully.");
+      setForm(INITIAL_FORM);
+    }} catch (err) {{
+      setMessage(err.message);
+    }} finally {{
+      setSubmitting(false);
+    }}
+  }}
+
+  return (
+    <form className="model-form" onSubmit={{handleSubmit}}>
+      <h1>Create {model}</h1>
+{create_inputs_str}
+      <button type="submit" disabled={{submitting}}>
+        {{submitting ? "Submitting..." : "Create"}}
+      </button>
+
+      {{message && <p role="status" className="status-msg">{{message}}</p>}}
+      {{errors && <pre role="alert" className="error-box">{{JSON.stringify(errors, null, 2)}}</pre>}}
+    </form>
+  );
+}}
+'''
+
+        update_form_inputs = []
+        for f in writable:
+            name = f["name"]
+            typ = ("number" if f["type"] in ("integer", "number", "decimal (string)")
+                   else "date" if f["type"] == "date (YYYY-MM-DD)"
+                   else "email" if "email" in name
+                   else "text")
+            req = "required" if f["required"] == "yes" else ""
+            update_form_inputs.append(
+                f'      <div className="form-group">\n'
+                f'        <label htmlFor="{name}">{name.replace("_", " ").title()}</label>\n'
+                f'        <input\n'
+                f'          id="{name}"\n'
+                f'          name="{name}"\n'
+                f'          type="{typ}"\n'
+                f'          value={{form["{name}"] ?? ""}}\n'
+                f'          onChange={{handleChange}}\n'
+                f'          {req}\n'
+                f'        />\n'
+                f'      </div>'
+            )
+
+        update_inputs_str = "\n".join(update_form_inputs)
+
+        update_form_code = f'''import {{ useEffect, useState }} from "react";
+
+const API_URL = "{api_url}";
+
+const INITIAL_FORM = {{
+{initial_state_lines}
+}};
+
+export default function Update{model}Form({{ id }}) {{
+  const [form, setForm] = useState(INITIAL_FORM);
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState("");
+  const [errors, setErrors] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {{
+    if (!id) return;
+    const controller = new AbortController();
+
+    fetch(`${{API_URL}}${{id}}/`, {{ signal: controller.signal }})
+      .then((res) => {{
+        if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+        return res.json();
+      }})
+      .then((data) => {{
+        const updatedState = {{}};
+        Object.keys(INITIAL_FORM).forEach((key) => {{
+          updatedState[key] = data[key] ?? "";
+        }});
+        setForm(updatedState);
+      }})
+      .catch((err) => {{
+        if (err.name !== "AbortError") setMessage(`Failed to load: ${{err.message}}`);
+      }})
+      .finally(() => setLoading(false));
+
+    return () => controller.abort();
+  }}, [id]);
+
+  function handleChange(e) {{
+    const {{ name, value, type, checked }} = e.target;
+    setForm((prev) => ({{
+      ...prev,
+      [name]: type === "checkbox" ? checked : type === "number" && value !== "" ? Number(value) : value,
+    }}));
+  }}
+
+  async function handleSubmit(e) {{
+    e.preventDefault();
+    setMessage("");
+    setErrors(null);
+    setSubmitting(true);
+
+    try {{
+      const response = await fetch(`${{API_URL}}${{id}}/`, {{
+        method: "PUT",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(form),
+      }});
+      const data = await response.json().catch(() => ({{}}));
+
+      if (!response.ok) {{
+        setErrors(data);
+        throw new Error("Update failed. Please check form validation errors.");
+      }}
+
+      setMessage("Updated successfully!");
+    }} catch (err) {{
+      setMessage(err.message);
+    }} finally {{
+      setSubmitting(false);
+    }}
+  }}
+
+  if (loading) return <p className="loading">Loading record details...</p>;
+
+  return (
+    <form className="model-form" onSubmit={{handleSubmit}}>
+      <h1>Update {model} #{id}</h1>
+{update_inputs_str}
+      <button type="submit" disabled={{submitting}}>
+        {{submitting ? "Saving..." : "Update {model}"}}
+      </button>
+
+      {{message && <p role="status" className="status-msg">{{message}}</p>}}
+      {{errors && <pre role="alert" className="error-box">{{JSON.stringify(errors, null, 2)}}</pre>}}
+    </form>
+  );
+}}
+'''
+
+        return {
+            "List": list_code,
+            "Card": card_code,
+            "Create Form": create_form_code,
+            "Update Form": update_form_code,
+        }
+
+    def render_frontend(self):
+        names = [d["name"] for d in self.docs]
+        self.frontend_model_combo["values"] = names
+        if not names:
+            return
+        if self.frontend_model_var.get() not in names:
+            self.frontend_model_var.set(names[0])
+        doc = next((d for d in self.docs if d["name"] == self.frontend_model_var.get()), None)
+        if not doc:
+            return
+        for label, code in self._react_samples(doc).items():
+            widget = self.frontend_widgets[label]
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", code)
+            apply_highlight(widget)
+            widget.config(state="disabled")
+            self.outputs[f"frontend/{label.replace(' ', '')}.jsx"] = code
+
     # ---- output actions --------------------------------------------------
     def copy_current(self):
-        fname = self.tabs.tab(self.tabs.select(), "text")
-        if fname == self.PAYLOAD_TAB:
-            doc = self.current_doc()
-            if not doc:
-                return
-            part = self.ptabs.tab(self.ptabs.select(), "text")
-            data = {"Fields": doc["fields"], "REST API": doc["rest"],
-                    "WebSocket": doc["ws"]}.get(part)
-            content = _jd(data)
-            label = f"{doc['name']} {part}"
+        category = self.categories.tab(self.categories.select(), "text")
+        if category == self.FRONTEND_TAB:
+            label = self.frontend_tabs.tab(self.frontend_tabs.select(), "text")
+            content = self.outputs.get(f"frontend/{label.replace(' ', '')}.jsx", "")
+            label = f"React {label}"
         else:
-            content = self.outputs.get(fname, "")
-            label = fname
-        if not content:
-            return
+            fname = self.tabs.tab(self.tabs.select(), "text")
+            if fname == self.PAYLOAD_TAB:
+                doc = self.current_doc()
+                if not doc: return
+                part = self.ptabs.tab(self.ptabs.select(), "text")
+                data = {"Fields": doc["fields"], "REST API": doc["rest"], "WebSocket": doc["ws"]}.get(part)
+                content = _jd(data)
+                label = f"{doc['name']} {part}"
+            else:
+                content = self.outputs.get(fname, "")
+                label = fname
+        if not content: return
         self.clipboard_clear()
         self.clipboard_append(content)
         self.set_status(f"Copied {label}")
@@ -1926,8 +2301,10 @@ class App(tk.Tk):
         if not folder:
             return
         files = {k: v for k, v in self.outputs.items()
-                 if v and k not in SNIPPET_ONLY}
+                 if v and k not in SNIPPET_ONLY and not k.startswith("frontend/")}
         files["payloads.json"] = _jd(self.docs)
+        frontend_files = {k.split("/", 1)[1]: v for k, v in self.outputs.items()
+                          if v and k.startswith("frontend/")}
         written = []
         for fname, content in files.items():
             path = os.path.join(folder, fname)
@@ -1937,6 +2314,14 @@ class App(tk.Tk):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             written.append(fname)
+        for fname, content in frontend_files.items():
+            path = os.path.join(folder, "frontend", fname)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path) and not messagebox.askyesno("Overwrite?", f"frontend/{fname} already exists. Overwrite it?"):
+                continue
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            written.append(f"frontend/{fname}")
         self.set_status(f"Saved: {', '.join(written) or 'nothing'}")
 
 
