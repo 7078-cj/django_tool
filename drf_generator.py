@@ -1047,6 +1047,209 @@ def build_routing(models):
     return "\n".join(lines) + "\n"
 
 
+def build_tests(models, details, permission="None", models_module=".models"):
+    """tests.py: APIClient CRUD, validation, not-found, and permission tests."""
+    names = [name for name, _, _ in models]
+    model_payloads = {}
+    model_relations = {}
+    for name in names:
+        detail = (details or {}).get(
+            name, {"fields": [], "pk": "id", "pk_type": "AutoField"})
+        infos = detail["fields"]
+        model_payloads[name] = {
+            info["name"]: sample_value(info)
+            for info in infos if not is_read_only(info)
+        }
+        model_relations[name] = [
+            (info["name"], info["target"], info["type"])
+            for info in infos
+            if info["type"] in ("ForeignKey", "OneToOneField",
+                                "ManyToManyField")
+            and info["target"] in names
+        ]
+    lines = [
+        '"""Generated REST API tests. Adjust sample values to match your fixtures."""',
+        "",
+        "import uuid",
+        "from types import SimpleNamespace",
+        "",
+        "from django.urls import reverse",
+        "from rest_framework.test import APITestCase",
+        "",
+        f"from {models_module} import {', '.join(names)}",
+        "", "",
+    ]
+    if any(model_relations.values()):
+        lines += [
+            f"_TEST_PAYLOADS = {model_payloads!r}",
+            "",
+            "def _create_related_instance(model_class, creating=()):",
+            "    if model_class in creating:",
+            "        raise ValueError(",
+            "            'Circular model relation; provide a project-specific fixture.')",
+            "    payload = dict(_TEST_PAYLOADS.get(model_class.__name__, {}))",
+            "    many_to_many = model_class._meta.many_to_many",
+            "    for field in many_to_many:",
+            "        payload.pop(field.name, None)",
+            "    for field in model_class._meta.concrete_fields:",
+            "        if not field.is_relation:",
+            "            continue",
+            "        related_model = field.remote_field.model",
+            "        if related_model.__name__ in _TEST_PAYLOADS:",
+            "            related = _create_related_instance(",
+            "                related_model, creating + (model_class,))",
+            "            payload[field.name] = related.pk",
+            "    instance = model_class.objects.create(**payload)",
+            "    for field in many_to_many:",
+            "        related_model = field.remote_field.model",
+            "        if related_model.__name__ in _TEST_PAYLOADS:",
+            "            related = _create_related_instance(",
+            "                related_model, creating + (model_class,))",
+            "            getattr(instance, field.name).add(related)",
+            "    return instance",
+            "", "",
+        ]
+
+    for name, _, _ in models:
+        detail = (details or {}).get(
+            name, {"fields": [], "pk": "id", "pk_type": "AutoField"})
+        infos = detail["fields"]
+        pk = detail["pk"]
+        payload = model_payloads[name]
+        route_name = snake(name)
+        class_name = f"{name}APITests"
+        lines += [
+            f"class {class_name}(APITestCase):",
+            f"    model = {name}",
+            f"    list_url_name = '{route_name}-list'",
+            f"    detail_url_name = '{route_name}-detail'",
+            f"    pk_field = '{pk}'",
+        ]
+        if any(info["type"] in ("ForeignKey", "OneToOneField",
+                                "ManyToManyField")
+               and info["target"] not in names for info in infos):
+            lines.append(
+                "    # Set up related records for models not included in this input.")
+        lines += [
+            f"    valid_payload = {payload!r}",
+            "",
+        ]
+        if model_relations[name]:
+            lines += [
+                "    def setUp(self):",
+                "        super().setUp()",
+                "        self.valid_payload = dict(self.valid_payload)",
+            ]
+            for field_name, target, field_type in model_relations[name]:
+                lines += [
+                    f"        related_{field_name} = _create_related_instance({target})",
+                    f"        self.valid_payload['{field_name}'] = "
+                    f"[related_{field_name}.pk]"
+                    if field_type == "ManyToManyField"
+                    else f"        self.valid_payload['{field_name}'] = "
+                    f"related_{field_name}.pk",
+                ]
+            lines.append("")
+        lines += [
+            "    def authenticate(self, is_staff=True):",
+            "        self.client.force_authenticate(user=SimpleNamespace(",
+            "            is_authenticated=True, is_staff=is_staff))",
+            "",
+            "    def list_url(self):",
+            "        return reverse(self.list_url_name)",
+            "",
+            "    def detail_url(self, pk):",
+            "        return reverse(self.detail_url_name, kwargs={'pk': pk})",
+            "",
+            "    def missing_pk(self):",
+        ]
+        if detail["pk_type"] == "UUIDField":
+            lines += [
+                "        candidate = uuid.UUID('00000000-0000-0000-0000-000000000001')",
+                "        while self.model.objects.filter(pk=candidate).exists():",
+                "            candidate = uuid.uuid4()",
+                "        return candidate",
+            ]
+        elif detail["pk_type"] in ("CharField", "SlugField"):
+            lines += [
+                "        candidate = '__missing_test_record__'",
+                "        while self.model.objects.filter(pk=candidate).exists():",
+                "            candidate += '_'",
+                "        return candidate",
+            ]
+        else:
+            lines += [
+                "        last_pk = self.model.objects.order_by('-pk').values_list(",
+                "            'pk', flat=True).first()",
+                "        return (last_pk or 0) + 1",
+            ]
+        lines += [
+            "",
+            "    def test_crud_happy_path(self):",
+            "        self.authenticate()",
+            "        created = self.client.post(self.list_url(), self.valid_payload,",
+            "                                   format='json')",
+            "        self.assertEqual(created.status_code, 201, created.data)",
+            "        self.assertIn(self.pk_field, created.data)",
+            "        pk = created.data[self.pk_field]",
+            "",
+            "        listed = self.client.get(self.list_url())",
+            "        self.assertEqual(listed.status_code, 200)",
+            "        retrieved = self.client.get(self.detail_url(pk))",
+            "        self.assertEqual(retrieved.status_code, 200)",
+            "",
+            "        writable = next(iter(self.valid_payload), None)",
+            "        if writable:",
+            "            updated = self.client.patch(",
+            "                self.detail_url(pk), {writable: self.valid_payload[writable]},",
+            "                format='json')",
+            "            self.assertEqual(updated.status_code, 200, updated.data)",
+            "",
+            "        deleted = self.client.delete(self.detail_url(pk))",
+            "        self.assertEqual(deleted.status_code, 204)",
+            "        missing = self.client.get(self.detail_url(pk))",
+            "        self.assertEqual(missing.status_code, 404)",
+            "",
+            "    def test_invalid_payload_returns_400(self):",
+            "        self.authenticate()",
+            "        response = self.client.post(self.list_url(), [], format='json')",
+            "        self.assertEqual(response.status_code, 400)",
+            "",
+            "    def test_unknown_record_returns_404(self):",
+            "        self.authenticate()",
+            "        response = self.client.get(self.detail_url(self.missing_pk()))",
+            "        self.assertEqual(response.status_code, 404)",
+        ]
+        if permission == "IsAuthenticated":
+            lines += [
+                "",
+                "    def test_authentication_is_required(self):",
+                "        response = self.client.get(self.list_url())",
+                "        self.assertIn(response.status_code, (401, 403))",
+            ]
+        elif permission == "IsAdminUser":
+            lines += [
+                "",
+                "    def test_staff_access_is_required(self):",
+                "        response = self.client.get(self.list_url())",
+                "        self.assertIn(response.status_code, (401, 403))",
+                "        self.authenticate(is_staff=False)",
+                "        response = self.client.get(self.list_url())",
+                "        self.assertEqual(response.status_code, 403)",
+            ]
+        elif permission == "IsAuthenticatedOrReadOnly":
+            lines += [
+                "",
+                "    def test_unauthenticated_write_is_denied(self):",
+                "        response = self.client.post(",
+                "            self.list_url(), self.valid_payload, format='json')",
+                "        self.assertIn(response.status_code, (401, 403))",
+                "        self.assertEqual(self.client.get(self.list_url()).status_code, 200)",
+            ]
+        lines += ["", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def generate(models, explicit_fields=False, permission="None", with_urls=True,
              models_module=".models", optimize=True, signals=(), websocket=False,
              details=None, filtering=False, search=False, ordering=False):
@@ -1060,7 +1263,9 @@ def generate(models, explicit_fields=False, permission="None", with_urls=True,
                 "    class Meta:",
                 f"        model = {name}"]
         if explicit_fields and fields:
-            listing = ", ".join(f"'{f}'" for f in ["id"] + fields)
+            pk = (details or {}).get(name, {}).get("pk", "id")
+            listing_fields = fields if pk != "id" else ["id"] + fields
+            listing = ", ".join(f"'{f}'" for f in listing_fields)
             ser.append(f"        fields = [{listing}]")
         else:
             ser.append("        fields = '__all__'")
@@ -1147,12 +1352,13 @@ def generate(models, explicit_fields=False, permission="None", with_urls=True,
         routing_py = build_routing(models)
         setup_py = CHANNELS_SETUP
 
+    tests_py = build_tests(models, details, permission, models_module)
     return {"serializers.py": serializers_py, "views.py": views_py,
             "urls.py": urls_py, "filters.py": filters_py,
             "signals.py": signals_py,
             "consumers.py": consumers_py, "routing.py": routing_py,
             "channels_setup.py": setup_py,
-            "filtering_setup.py": filtering_setup}
+            "filtering_setup.py": filtering_setup, "tests.py": tests_py}
 
 
 # --------------------------------------------------------------------------
@@ -1542,7 +1748,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DRF Generator")
-        self.geometry("1400x820")
+        self.geometry("1480x900")
         self.minsize(1000, 560)
         self.configure(bg=UI["bg"])
 
@@ -1568,6 +1774,7 @@ class App(tk.Tk):
         self.signal_buttons = []
         self._hl_job = None
         self._gen_job = None
+        self.options_window = None
 
         self._style()
         self._build()
@@ -1613,6 +1820,10 @@ class App(tk.Tk):
         s.configure("Accent.TButton", background=UI["accent"], foreground="white",
                     font=ui_font(10, True), padding=(16, 6), borderwidth=0)
         s.map("Accent.TButton", background=[("active", UI["accent_dark"])])
+        s.configure("TEntry", padding=(7, 5))
+        s.configure("TCombobox", padding=(7, 5))
+        s.configure("TLabelframe", padding=(12, 8))
+        s.configure("TNotebook.Tab", padding=(14, 8))
         s.configure("Treeview", rowheight=28, background=UI["card"],
                     fieldbackground=UI["card"], borderwidth=0)
         s.configure("Treeview.Heading", background=UI["tab"], font=ui_font(10, True),
@@ -1627,68 +1838,61 @@ class App(tk.Tk):
         return lf
 
     def _build(self):
-        row1 = ttk.Frame(self, padding=(12, 10, 12, 0))
-        row1.pack(fill="x")
-        g = self._group(row1, "Code")
-        ttk.Checkbutton(g, text="Optimize queries", variable=self.optimize
-                        ).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(g, text="Explicit field list", variable=self.explicit
-                        ).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(g, text="urls.py", variable=self.with_urls).pack(side="left")
-        g = self._group(row1, "Permission")
-        ttk.Combobox(g, textvariable=self.permission, width=26, state="readonly",
-                     values=["None", "IsAuthenticated", "IsAuthenticatedOrReadOnly",
-                             "IsAdminUser", "AllowAny"]).pack(side="left")
-        g = self._group(row1, "Models import")
-        ttk.Entry(g, textvariable=self.module, width=14).pack(side="left")
-        g = self._group(row1, "WebSocket")
-        ttk.Checkbutton(g, text="Consumers, routing, setup", variable=self.gen_ws
-                        ).pack(side="left")
-
-        row2 = ttk.Frame(self, padding=(12, 6, 12, 8))
-        row2.pack(fill="x")
-        g = self._group(row2, "Signals")
-        ttk.Checkbutton(g, text="signals.py", variable=self.gen_signals
-                        ).pack(side="left", padx=(0, 12))
-        for sig in SIGNAL_ORDER:
-            cb = ttk.Checkbutton(g, text=sig, variable=self.signal_vars[sig])
-            cb.pack(side="left", padx=(0, 10))
-            self.signal_buttons.append(cb)
-        g = self._group(row2, "Filtering")
-        ttk.Checkbutton(g, text="filters.py (django-filter)",
-                        variable=self.gen_filters).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(g, text="Search", variable=self.gen_search
-                        ).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(g, text="Ordering", variable=self.gen_ordering
-                        ).pack(side="left")
+        header = ttk.Frame(self, padding=(18, 14, 18, 10))
+        header.pack(fill="x")
+        brand = ttk.Frame(header)
+        brand.pack(side="left", fill="x", expand=True)
+        ttk.Label(brand, text="DRF Generator",
+                  font=ui_font(18, True)).pack(anchor="w")
+        ttk.Label(
+            brand,
+            text="Turn Django models into ready-to-review API code and tests.",
+            foreground=UI["muted"],
+        ).pack(anchor="w", pady=(2, 0))
+        actions = ttk.Frame(header)
+        actions.pack(side="right")
+        ttk.Button(actions, text="Options", command=self.show_options
+                   ).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Generate", style="Accent.TButton",
+                   command=self.generate).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Save all...", command=self.save_all
+                   ).pack(side="left")
 
         panes = tk.PanedWindow(self, orient="horizontal", sashwidth=8,
                                sashrelief="flat", bg=UI["border"], bd=0)
-        panes.pack(fill="both", expand=True, padx=12, pady=(0, 6))
-        left = ttk.Labelframe(panes, text="Django models", padding=6)
+        panes.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        left = ttk.Labelframe(panes, text="1  Django models", padding=10)
         right = ttk.Frame(panes)
-        panes.add(left, minsize=340, width=480, stretch="always")
+        panes.add(left, minsize=360, width=510, stretch="always")
         panes.add(right, minsize=520, stretch="always")
 
+        input_tools = ttk.Frame(left)
+        input_tools.pack(fill="x", pady=(0, 8))
+        ttk.Label(input_tools, text="Paste or type your model definitions.",
+                  foreground=UI["muted"]).pack(side="left")
+        self.model_count = ttk.Label(input_tools, text="0 models",
+                                     foreground=UI["muted"])
+        self.model_count.pack(side="right")
         self.input = make_editor(left)
         self.input.container.pack(fill="both", expand=True)
         self.input.bind("<<Modified>>", self._on_modified)
         side = ttk.Frame(left)
-        side.pack(fill="x", pady=(6, 0))
-        ttk.Button(side, text="Paste from clipboard", command=self.paste_clipboard
+        side.pack(fill="x", pady=(8, 0))
+        ttk.Button(side, text="Paste", command=self.paste_clipboard
                    ).pack(side="left")
-        ttk.Button(side, text="Load sample", command=self.load_sample
+        ttk.Button(side, text="Load example", command=self.load_sample
                    ).pack(side="left", padx=6)
-        ttk.Button(side, text="Clear", command=self.clear_input).pack(side="left")
+        ttk.Button(side, text="Clear input", command=self.clear_input
+                   ).pack(side="left")
 
         self.categories = ttk.Notebook(right)
         self.categories.pack(fill="both", expand=True)
         backend = ttk.Frame(self.categories)
-        self.categories.add(backend, text=self.BACKEND_TAB)
+        self.categories.add(backend, text="Backend files")
         self.tabs = ttk.Notebook(backend)
         self.tabs.pack(fill="both", expand=True)
         self.out_widgets = {}
-        for fname in ("serializers.py", "views.py", "urls.py", "filters.py", "signals.py", "consumers.py", "routing.py", "channels_setup.py", "filtering_setup.py"):
+        for fname in ("serializers.py", "views.py", "urls.py", "tests.py", "filters.py", "signals.py", "consumers.py", "routing.py", "channels_setup.py", "filtering_setup.py"):
             txt = make_editor(self.tabs, readonly=True)
             txt.config(state="disabled")
             self.tabs.add(txt.container, text=fname)
@@ -1697,22 +1901,102 @@ class App(tk.Tk):
         self.tabs.add(pay, text=self.PAYLOAD_TAB)
         self._build_payload_tab(pay)
         frontend = ttk.Frame(self.categories)
-        self.categories.add(frontend, text=self.FRONTEND_TAB)
+        self.categories.add(frontend, text="React examples")
         self._build_frontend_tab(frontend)
 
         bottom = ttk.Frame(self, padding=(12, 4, 12, 12))
         bottom.pack(fill="x")
-        ttk.Button(bottom, text="Generate  (Ctrl+Enter)", style="Accent.TButton",
-                   command=self.generate).pack(side="left")
-        ttk.Button(bottom, text="Copy current tab", command=self.copy_current
-                   ).pack(side="left", padx=8)
-        ttk.Button(bottom, text="Save all to folder...", command=self.save_all
-                   ).pack(side="left")
         self.status = tk.Label(bottom, text="", bg=UI["bg"], fg=UI["muted"],
                                font=ui_font(10), anchor="e")
-        self.status.pack(side="right", fill="x", expand=True)
+        self.status.pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom, text="Copy current tab", command=self.copy_current
+                   ).pack(side="right")
+        ttk.Label(bottom, text="Ctrl+Enter: generate   Ctrl+S: save",
+                  foreground=UI["muted"]).pack(side="right", padx=(0, 14))
 
         self.bind("<Control-Return>", lambda e: self.generate())
+        self.bind("<Control-s>", lambda e: self.save_all())
+        self.bind("<Control-S>", lambda e: self.save_all())
+        self.bind("<Control-Shift-c>", lambda e: self.copy_current())
+
+    def show_options(self):
+        if self.options_window and self.options_window.winfo_exists():
+            self.options_window.deiconify()
+            self.options_window.lift()
+            return
+
+        window = tk.Toplevel(self)
+        self.options_window = window
+        window.title("Generation options")
+        window.transient(self)
+        window.resizable(False, False)
+        window.configure(bg=UI["bg"])
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+
+        body = ttk.Frame(window, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Generation options",
+                  font=ui_font(16, True)).pack(anchor="w")
+        ttk.Label(body, text="Changes are applied automatically.",
+                  foreground=UI["muted"]).pack(anchor="w", pady=(2, 12))
+
+        settings = ttk.Frame(body)
+        settings.pack(fill="x")
+        code = ttk.Labelframe(settings, text="Code")
+        code.pack(fill="x", pady=(0, 10))
+        ttk.Checkbutton(code, text="Optimize database queries",
+                        variable=self.optimize).pack(anchor="w", pady=3)
+        ttk.Checkbutton(code, text="Use an explicit serializer field list",
+                        variable=self.explicit).pack(anchor="w", pady=3)
+        ttk.Checkbutton(code, text="Generate urls.py",
+                        variable=self.with_urls).pack(anchor="w", pady=3)
+
+        access = ttk.Labelframe(settings, text="Access and imports")
+        access.pack(fill="x", pady=(0, 10))
+        ttk.Label(access, text="Default permission").grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        permission = ttk.Combobox(
+            access, textvariable=self.permission, width=30, state="readonly",
+            values=["None", "IsAuthenticated", "IsAuthenticatedOrReadOnly",
+                    "IsAdminUser", "AllowAny"])
+        permission.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(access, text="Models import path").grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(access, textvariable=self.module, width=34).grid(
+            row=1, column=1, sticky="ew", pady=4)
+        access.columnconfigure(1, weight=1)
+
+        optional = ttk.Labelframe(settings, text="Optional files")
+        optional.pack(fill="x")
+        ttk.Checkbutton(optional, text="WebSocket consumers and setup",
+                        variable=self.gen_ws).pack(anchor="w", pady=3)
+        ttk.Checkbutton(optional, text="Generate signal receivers",
+                        variable=self.gen_signals).pack(anchor="w", pady=3)
+        signals = ttk.Frame(optional)
+        signals.pack(fill="x", padx=(20, 0), pady=(0, 4))
+        self.signal_buttons = []
+        for sig in SIGNAL_ORDER:
+            cb = ttk.Checkbutton(signals, text=sig, variable=self.signal_vars[sig])
+            cb.pack(side="left", padx=(0, 10))
+            self.signal_buttons.append(cb)
+
+        filtering = ttk.Frame(optional)
+        filtering.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(filtering, text="Filters",
+                        variable=self.gen_filters).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(filtering, text="Search",
+                        variable=self.gen_search).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(filtering, text="Ordering",
+                        variable=self.gen_ordering).pack(side="left")
+
+        ttk.Button(body, text="Done", command=window.destroy
+                   ).pack(anchor="e", pady=(12, 0))
+        window.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - window.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - window.winfo_height()) // 2)
+        window.geometry(f"+{x}+{y}")
+        window.grab_set()
+        self._sync_signal_state()
 
     def _build_payload_tab(self, parent):
         top = ttk.Frame(parent, padding=(10, 10, 10, 6))
@@ -1823,14 +2107,15 @@ class App(tk.Tk):
             models = parse_models(src)
             details = parse_field_details(src)
         except SyntaxError as e:
-            self.set_status(f"Syntax error on line {e.lineno}: {e.msg}", "error")
+            self._clear_generated_outputs(
+                f"Syntax error on line {e.lineno}: {e.msg}")
             return
         except ValueError as e:
-            self.set_status(f"Cannot read the models: {e}", "error")
+            self._clear_generated_outputs(f"Cannot read the models: {e}")
             return
         if not models:
-            self.set_status("No Django models found. Paste classes that extend "
-                            "models.Model.", "error")
+            self._clear_generated_outputs(
+                "No Django models found. Paste classes that extend models.Model.")
             return
 
         permission = self.permission.get()
@@ -1868,7 +2153,24 @@ class App(tk.Tk):
             self.model_var.set(names[0])
         self.render_payloads()
         self.render_frontend()
+        self.model_count.config(
+            text=f"{len(models)} model{'s' if len(models) != 1 else ''}")
         self.set_status(f"Generated for {len(models)} model(s): {', '.join(names)}")
+
+    def _clear_generated_outputs(self, message):
+        self.outputs = {}
+        self.docs = []
+        self.model_count.config(text="0 models")
+        for fname, widget in self.out_widgets.items():
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "# " + message + "\n")
+            widget.config(state="disabled")
+        self.model_combo["values"] = ()
+        self.frontend_model_combo["values"] = ()
+        self.render_payloads()
+        self.render_frontend()
+        self.set_status(message, "error")
 
     def current_doc(self):
         return next((d for d in self.docs if d["name"] == self.model_var.get()), None)
@@ -2253,6 +2555,13 @@ export default function Update{model}Form({{ id }}) {{
         names = [d["name"] for d in self.docs]
         self.frontend_model_combo["values"] = names
         if not names:
+            for widget in self.frontend_widgets.values():
+                widget.config(state="normal")
+                widget.delete("1.0", "end")
+                widget.config(state="disabled")
+            for key in list(self.outputs):
+                if key.startswith("frontend/"):
+                    del self.outputs[key]
             return
         if self.frontend_model_var.get() not in names:
             self.frontend_model_var.set(names[0])
@@ -2270,8 +2579,7 @@ export default function Update{model}Form({{ id }}) {{
 
     # ---- output actions --------------------------------------------------
     def copy_current(self):
-        category = self.categories.tab(self.categories.select(), "text")
-        if category == self.FRONTEND_TAB:
+        if self.categories.index(self.categories.select()) == 1:
             label = self.frontend_tabs.tab(self.frontend_tabs.select(), "text")
             content = self.outputs.get(f"frontend/{label.replace(' ', '')}.jsx", "")
             label = f"React {label}"

@@ -3,7 +3,7 @@
 <img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/27cac2a6-bc33-4874-b126-989e6775ddb9" />
 # DRF Generator
 
-A small desktop tool that turns pasted Django models into Django REST Framework boilerplate: serializers, views, URLs, filters, signals and WebSocket consumers. It also builds a readable API reference showing what a frontend sends and receives for every REST endpoint and WebSocket action.
+A small desktop tool that turns pasted Django models into Django REST Framework boilerplate: serializers, views, URLs, CRUD tests, filters, signals and WebSocket consumers. It also builds a readable API reference showing what a frontend sends and receives for every REST endpoint and WebSocket action.
 
 It is a single Python file that uses only the standard library (Tkinter). Django does **not** need to be installed, because models are parsed with the `ast` module and never imported.
 
@@ -11,6 +11,7 @@ It is a single Python file that uses only the standard library (Tkinter). Django
 
 - **Serializers**: a `ModelSerializer` per model, with `__all__` or an explicit field list.
 - **Views**: `ListCreateAPIView` and `RetrieveUpdateDestroyAPIView` per model, with optional `select_related` / `prefetch_related` to avoid N+1 queries.
+- **CRUD tests**: generated Django REST Framework API tests for list, create, retrieve, update, delete, invalid payloads and missing records, with permission checks when authentication is enabled.
 - **URLs**: routes with the right converter for the primary key (`int`, `uuid` or `str`).
 - **Permissions**: `IsAuthenticated`, `IsAuthenticatedOrReadOnly`, `IsAdminUser` or `AllowAny`, applied to views and WebSocket consumers.
 - **Filtering**: django-filter `FilterSet` classes with lookups chosen by field type, plus optional `SearchFilter` and `OrderingFilter`.
@@ -33,9 +34,9 @@ python drf_generator.py
 ## How to use
 
 1. Paste your Django models into the **Django models** pane (or use **Paste from clipboard** / **Load sample**).
-2. Choose your options at the top. The output updates automatically.
+2. Open **Options** to choose permissions, imports, and optional files. Changes regenerate the output automatically.
 3. Open the tabs on the right to review the generated files.
-4. Use **Copy current tab** for one file, or **Save all to folder...** to write the files into your Django app folder.
+4. Use **Copy current tab** for one file, or **Save all...** to write the files into your Django app folder. **Ctrl+Enter** regenerates and **Ctrl+S** opens the save dialog.
 
 ### Options
 
@@ -59,6 +60,7 @@ python drf_generator.py
 | `serializers.py` | Yes | |
 | `views.py` | Yes | Filter backends are set on the list views only |
 | `urls.py` | Yes | |
+| `tests.py` | Yes | CRUD happy path, invalid-payload / not-found errors, and permission checks |
 | `filters.py` | Yes | Needs `django-filter` |
 | `signals.py` | Yes | Import it in `AppConfig.ready()` (instructions are in the file header) |
 | `consumers.py` | Yes | Needs `channels` |
@@ -90,6 +92,12 @@ Pick a model, then switch between three views:
 - **WebSocket**: the connect URL, then what you send, receive and what other connected clients receive for `list`, `create`, `retrieve`, `update` and `delete`, plus every error message.
 
 The sample values are generated from the field types, so replace them with real data when you document your API.
+
+## Generated CRUD tests
+
+The generated `tests.py` contains an API happy-path test for each model, covering create, list, retrieve, partial update and delete. It also checks a malformed request and a missing record. When the selected permission is `IsAuthenticated`, `IsAuthenticatedOrReadOnly` or `IsAdminUser`, the tests include unauthenticated access checks; successful CRUD requests use DRF's `force_authenticate` with a lightweight test user (staff for `IsAdminUser`).
+
+Run the tests with your Django project, for example `python manage.py test your_app`. The app's generated URL patterns must be included in the project URL configuration so the generated route names can be reversed. Review and adjust generated sample values—especially IDs for foreign-key, one-to-one and many-to-many fields—if your test database requires related records or model-specific fixtures.
 
 ## What it can parse
 
